@@ -2,13 +2,9 @@ services:
   - type: web
     name: fangai
     env: docker
-    plan: starter
+    plan: free
     autoDeploy: true
     healthCheckPath: /api/health
-    disk:
-      name: fangai-data
-      mountPath: /data
-      sizeGB: 10
     envVars:
       - key: DEFAULT_MODEL_PROVIDER
         value: anthropic
