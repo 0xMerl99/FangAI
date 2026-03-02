@@ -43,3 +43,24 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Node / frontend artifacts
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# JS build artifacts
+dist/
+build/
+coverage/
+.next/
+.nuxt/
+.cache/
+
+# Local runtime / temp files
+tmp/
+temp/
+*.log

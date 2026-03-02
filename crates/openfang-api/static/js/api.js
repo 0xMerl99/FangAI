@@ -1,8 +1,8 @@
-// OpenFang API Client — Fetch wrapper, WebSocket manager, auth injection, toast notifications
+// FangAI API Client — Fetch wrapper, WebSocket manager, auth injection, toast notifications
 'use strict';
 
 // ── Toast Notification System ──
-var OpenFangToast = (function() {
+var FangAIToast = (function() {
   var _container = null;
   var _toastId = 0;
 
@@ -117,7 +117,7 @@ var OpenFangToast = (function() {
 
 // ── Friendly Error Messages ──
 function friendlyError(status, serverMsg) {
-  if (status === 0 || !status) return 'Cannot reach daemon — is openfang running?';
+  if (status === 0 || !status) return 'Cannot reach daemon — is it running?';
   if (status === 401) return 'Not authorized — check your API key';
   if (status === 403) return 'Permission denied';
   if (status === 404) return serverMsg || 'Resource not found';
@@ -129,10 +129,11 @@ function friendlyError(status, serverMsg) {
 }
 
 // ── API Client ──
-var OpenFangAPI = (function() {
+var FangAIAPI = (function() {
   var BASE = window.location.origin;
   var WS_BASE = BASE.replace(/^http/, 'ws');
   var _authToken = '';
+  var _userSession = '';
 
   // Connection state tracking
   var _connectionState = 'connected';
@@ -140,10 +141,12 @@ var OpenFangAPI = (function() {
   var _connectionListeners = [];
 
   function setAuthToken(token) { _authToken = token; }
+  function setUserSession(token) { _userSession = token || ''; }
 
   function headers() {
     var h = { 'Content-Type': 'application/json' };
     if (_authToken) h['Authorization'] = 'Bearer ' + _authToken;
+    if (_userSession) h['x-user-session'] = _userSession;
     return h;
   }
 
@@ -180,7 +183,7 @@ var OpenFangAPI = (function() {
     }).catch(function(e) {
       if (e.name === 'TypeError' && e.message.includes('Failed to fetch')) {
         setConnectionState('disconnected');
-        throw new Error('Cannot connect to daemon — is openfang running?');
+        throw new Error('Cannot connect to daemon — is it running?');
       }
       throw e;
     });
@@ -220,7 +223,7 @@ var OpenFangAPI = (function() {
         _reconnectAttempts = 0;
         setConnectionState('connected');
         if (_reconnectAttempt > 0) {
-          OpenFangToast.success('Reconnected');
+          FangAIToast.success('Reconnected');
           _reconnectAttempt = 0;
         }
         if (_wsCallbacks.onOpen) _wsCallbacks.onOpen();
@@ -241,7 +244,7 @@ var OpenFangAPI = (function() {
           _reconnectAttempt = _reconnectAttempts;
           setConnectionState('reconnecting');
           if (_reconnectAttempts === 1) {
-            OpenFangToast.warn('Connection lost, reconnecting...');
+            FangAIToast.warn('Connection lost, reconnecting...');
           }
           var delay = Math.min(1000 * Math.pow(2, _reconnectAttempts - 1), 10000);
           _reconnectTimer = setTimeout(function() { _doConnect(_wsAgentId); }, delay);
@@ -249,7 +252,7 @@ var OpenFangAPI = (function() {
         }
         if (_wsAgentId && _reconnectAttempts >= MAX_RECONNECT) {
           setConnectionState('disconnected');
-          OpenFangToast.error('Connection lost — switched to HTTP mode', 0);
+          FangAIToast.error('Connection lost — switched to HTTP mode', 0);
         }
         if (_wsCallbacks.onClose) _wsCallbacks.onClose();
       };
@@ -284,6 +287,7 @@ var OpenFangAPI = (function() {
   function getConnectionState() { return _connectionState; }
 
   function getToken() { return _authToken; }
+  function getUserSession() { return _userSession; }
 
   function upload(agentId, file) {
     var hdrs = {
@@ -291,6 +295,7 @@ var OpenFangAPI = (function() {
       'X-Filename': file.name
     };
     if (_authToken) hdrs['Authorization'] = 'Bearer ' + _authToken;
+    if (_userSession) hdrs['x-user-session'] = _userSession;
     return fetch(BASE + '/api/agents/' + agentId + '/upload', {
       method: 'POST',
       headers: hdrs,
@@ -303,7 +308,9 @@ var OpenFangAPI = (function() {
 
   return {
     setAuthToken: setAuthToken,
+    setUserSession: setUserSession,
     getToken: getToken,
+    getUserSession: getUserSession,
     get: get,
     post: post,
     put: put,
@@ -319,3 +326,6 @@ var OpenFangAPI = (function() {
     onConnectionChange: onConnectionChange
   };
 })();
+
+var OpenFangToast = FangAIToast;
+var OpenFangAPI = FangAIAPI;

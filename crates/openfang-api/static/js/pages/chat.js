@@ -1,4 +1,4 @@
-// OpenFang Chat Page — Agent chat with markdown + streaming
+// FangAI Chat Page — Agent chat with markdown + streaming
 'use strict';
 
 function chatPage() {
@@ -383,7 +383,7 @@ function chatPage() {
         this.messages.push({
           id: ++localMsgId,
           role: 'system',
-          text: '**Welcome to OpenFang Chat!**\n\n' +
+          text: '**Welcome to FANGAI Chat!**\n\n' +
             '- Type `/` to see available commands\n' +
             '- `/help` shows all commands\n' +
             '- `/think on` enables extended reasoning\n' +

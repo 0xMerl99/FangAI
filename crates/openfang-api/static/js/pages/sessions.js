@@ -1,4 +1,4 @@
-// OpenFang Sessions Page — Session listing + Memory tab
+// FangAI Sessions Page — Session listing + Memory tab
 'use strict';
 
 function sessionsPage() {

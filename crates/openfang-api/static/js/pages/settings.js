@@ -1,4 +1,4 @@
-// OpenFang Settings Page — Provider Hub, Model Catalog, Config, Tools + Security, Network, Migration tabs
+// FangAI Settings Page — Provider Hub, Model Catalog, Config, Tools + Security, Network, Migration tabs
 'use strict';
 
 function settingsPage() {

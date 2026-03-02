@@ -1,4 +1,4 @@
-// OpenFang Logs Page — Real-time log viewer (SSE streaming + polling fallback) + Audit Trail tab
+// FangAI Logs Page — Real-time log viewer (SSE streaming + polling fallback) + Audit Trail tab
 'use strict';
 
 function logsPage() {

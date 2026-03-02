@@ -1,4 +1,4 @@
-// OpenFang Workflows Page — Workflow builder + run history
+// FangAI Workflows Page — Workflow builder + run history
 'use strict';
 
 function workflowsPage() {

@@ -2,10 +2,11 @@
 
 use crate::types::*;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use openfang_kernel::triggers::{TriggerId, TriggerPattern};
 use openfang_kernel::workflow::{
     ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
@@ -33,13 +34,365 @@ pub struct AppState {
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
     /// Notify handle to trigger graceful HTTP server shutdown from the API.
     pub shutdown_notify: Arc<tokio::sync::Notify>,
+    /// In-memory Phantom login challenges (wallet -> (challenge, expires_at)).
+    pub wallet_challenges: DashMap<String, (String, i64)>,
+}
+
+const PHANTOM_CHALLENGE_TTL_SECS: i64 = 300;
+const PHANTOM_SESSION_TTL_SECS: i64 = 60 * 60 * 24 * 30;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PhantomUserRecord {
+    wallet_address: String,
+    created_at: i64,
+    last_login_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PhantomSessionRecord {
+    wallet_address: String,
+    expires_at: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PhantomChallengeRequest {
+    pub wallet_address: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PhantomVerifyRequest {
+    pub wallet_address: String,
+    pub signature_base64: String,
+}
+
+fn auth_store_id() -> AgentId {
+    AgentId(uuid::Uuid::from_bytes([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+    ]))
+}
+
+fn now_unix_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn is_valid_wallet_address(wallet: &str) -> bool {
+    match bs58::decode(wallet).into_vec() {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
+    }
+}
+
+fn wallet_user_key(wallet: &str) -> String {
+    format!("auth:user:{wallet}")
+}
+
+fn wallet_session_key(token: &str) -> String {
+    format!("auth:session:{token}")
+}
+
+fn agent_owner_key(agent_id: AgentId) -> String {
+    format!("auth:agent_owner:{agent_id}")
+}
+
+fn extract_user_session_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-user-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn require_wallet(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let token = extract_user_session_token(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Missing user session"})),
+        )
+    })?;
+
+    let key = wallet_session_key(&token);
+    let session_value = state
+        .kernel
+        .memory
+        .structured_get(auth_store_id(), &key)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Session store unavailable"})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid user session"})),
+            )
+        })?;
+
+    let session: PhantomSessionRecord = serde_json::from_value(session_value).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Corrupt user session"})),
+        )
+    })?;
+
+    if session.expires_at < now_unix_secs() {
+        let _ = state.kernel.memory.structured_delete(auth_store_id(), &key);
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "User session expired"})),
+        ));
+    }
+
+    Ok(session.wallet_address)
+}
+
+fn set_agent_owner(state: &Arc<AppState>, agent_id: AgentId, wallet: &str) {
+    let _ = state.kernel.memory.structured_set(
+        auth_store_id(),
+        &agent_owner_key(agent_id),
+        serde_json::Value::String(wallet.to_string()),
+    );
+}
+
+fn is_agent_owned_by_wallet(state: &Arc<AppState>, agent_id: AgentId, wallet: &str) -> bool {
+    match state
+        .kernel
+        .memory
+        .structured_get(auth_store_id(), &agent_owner_key(agent_id))
+    {
+        Ok(Some(serde_json::Value::String(owner))) => owner == wallet,
+        _ => false,
+    }
+}
+
+/// POST /api/auth/phantom/challenge — Create a sign-in challenge for Phantom wallet login.
+pub async fn phantom_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PhantomChallengeRequest>,
+) -> impl IntoResponse {
+    let wallet = req.wallet_address.trim().to_string();
+    if !is_valid_wallet_address(&wallet) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid wallet address"})),
+        );
+    }
+
+    let nonce = uuid::Uuid::new_v4();
+    let challenge = format!(
+        "OpenFang Login\nWallet: {wallet}\nNonce: {nonce}\nIssued At: {}",
+        now_unix_secs()
+    );
+    let expires_at = now_unix_secs() + PHANTOM_CHALLENGE_TTL_SECS;
+    state
+        .wallet_challenges
+        .insert(wallet.clone(), (challenge.clone(), expires_at));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "wallet_address": wallet,
+            "challenge": challenge,
+            "expires_in": PHANTOM_CHALLENGE_TTL_SECS,
+        })),
+    )
+}
+
+/// POST /api/auth/phantom/verify — Verify signed challenge and create persistent user session.
+pub async fn phantom_verify(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PhantomVerifyRequest>,
+) -> impl IntoResponse {
+    let wallet = req.wallet_address.trim().to_string();
+    if !is_valid_wallet_address(&wallet) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid wallet address"})),
+        );
+    }
+
+    let (challenge, expires_at) = match state.wallet_challenges.remove(&wallet) {
+        Some((_, value)) => value,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "No challenge found. Request a new challenge."})),
+            )
+        }
+    };
+
+    if expires_at < now_unix_secs() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Challenge expired"})),
+        );
+    }
+
+    let wallet_bytes = match bs58::decode(&wallet).into_vec() {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid wallet address bytes"})),
+            )
+        }
+    };
+    let signature_bytes = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        req.signature_base64.as_bytes(),
+    ) {
+        Ok(bytes) if bytes.len() == 64 => bytes,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid signature encoding"})),
+            )
+        }
+    };
+
+    let wallet_arr: [u8; 32] = match wallet_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid wallet key length"})),
+            )
+        }
+    };
+    let sig_arr: [u8; 64] = match signature_bytes.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid signature length"})),
+            )
+        }
+    };
+
+    let verify_key = match VerifyingKey::from_bytes(&wallet_arr) {
+        Ok(vk) => vk,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid wallet public key"})),
+            )
+        }
+    };
+    let signature = Signature::from_bytes(&sig_arr);
+    if verify_key.verify(challenge.as_bytes(), &signature).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Signature verification failed"})),
+        );
+    }
+
+    let now = now_unix_secs();
+    let user_key = wallet_user_key(&wallet);
+    let existing = state
+        .kernel
+        .memory
+        .structured_get(auth_store_id(), &user_key)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value::<PhantomUserRecord>(v).ok());
+    let created_at = existing.as_ref().map(|u| u.created_at).unwrap_or(now);
+    let user = PhantomUserRecord {
+        wallet_address: wallet.clone(),
+        created_at,
+        last_login_at: now,
+    };
+    if let Ok(user_json) = serde_json::to_value(&user) {
+        let _ = state
+            .kernel
+            .memory
+            .structured_set(auth_store_id(), &user_key, user_json);
+    }
+
+    let token = format!("ofs_{}", uuid::Uuid::new_v4());
+    let session = PhantomSessionRecord {
+        wallet_address: wallet,
+        expires_at: now + PHANTOM_SESSION_TTL_SECS,
+    };
+    if let Ok(session_json) = serde_json::to_value(&session) {
+        let _ = state.kernel.memory.structured_set(
+            auth_store_id(),
+            &wallet_session_key(&token),
+            session_json,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token": token,
+            "expires_in": PHANTOM_SESSION_TTL_SECS,
+            "user": user,
+        })),
+    )
+}
+
+/// GET /api/auth/phantom/me — Resolve current user from x-user-session.
+pub async fn phantom_me(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+
+    let user = state
+        .kernel
+        .memory
+        .structured_get(auth_store_id(), &wallet_user_key(&wallet))
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value::<PhantomUserRecord>(v).ok())
+        .unwrap_or(PhantomUserRecord {
+            wallet_address: wallet,
+            created_at: now_unix_secs(),
+            last_login_at: now_unix_secs(),
+        });
+
+    (StatusCode::OK, Json(serde_json::json!(user)))
+}
+
+/// POST /api/auth/phantom/logout — Revoke current user session.
+pub async fn phantom_logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_user_session_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing user session"})),
+            )
+        }
+    };
+
+    let _ = state
+        .kernel
+        .memory
+        .structured_delete(auth_store_id(), &wallet_session_key(&token));
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 /// POST /api/agents — Spawn a new agent.
 pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+
     // SECURITY: Reject oversized manifests to prevent parser memory exhaustion.
     const MAX_MANIFEST_SIZE: usize = 1024 * 1024; // 1MB
     if req.manifest_toml.len() > MAX_MANIFEST_SIZE {
@@ -93,13 +446,16 @@ pub async fn spawn_agent(
 
     let name = manifest.name.clone();
     match state.kernel.spawn_agent(manifest) {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!(SpawnResponse {
-                agent_id: id.to_string(),
-                name,
-            })),
-        ),
+        Ok(id) => {
+            set_agent_owner(&state, id, &wallet);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!(SpawnResponse {
+                    agent_id: id.to_string(),
+                    name,
+                })),
+            )
+        }
         Err(e) => {
             tracing::warn!("Spawn failed: {e}");
             (
@@ -111,12 +467,18 @@ pub async fn spawn_agent(
 }
 
 /// GET /api/agents — List all agents.
-pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+
     let agents: Vec<serde_json::Value> = state
         .kernel
         .registry
         .list()
         .into_iter()
+        .filter(|e| is_agent_owned_by_wallet(&state, e.id, &wallet))
         .map(|e| {
             serde_json::json!({
                 "id": e.id.to_string(),
@@ -136,7 +498,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
         })
         .collect();
 
-    Json(agents)
+    (StatusCode::OK, Json(serde_json::json!(agents)))
 }
 
 /// Resolve uploaded file attachments into ContentBlock::Image blocks.
@@ -230,6 +592,7 @@ pub fn inject_attachments_into_session(
 /// POST /api/agents/:id/message — Send a message to an agent.
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> impl IntoResponse {
@@ -242,6 +605,17 @@ pub async fn send_message(
             );
         }
     };
+
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
     const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
@@ -302,6 +676,7 @@ pub async fn send_message(
 /// GET /api/agents/:id/session — Get agent session (conversation history).
 pub async fn get_agent_session(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
@@ -313,6 +688,17 @@ pub async fn get_agent_session(
             );
         }
     };
+
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
 
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -423,6 +809,7 @@ pub async fn get_agent_session(
 /// DELETE /api/agents/:id — Kill an agent.
 pub async fn kill_agent(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
@@ -434,6 +821,17 @@ pub async fn kill_agent(
             );
         }
     };
+
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
 
     match state.kernel.kill_agent(agent_id) {
         Ok(()) => (
@@ -451,12 +849,18 @@ pub async fn kill_agent(
 }
 
 /// GET /api/status — Kernel status.
-pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+
     let agents: Vec<serde_json::Value> = state
         .kernel
         .registry
         .list()
         .into_iter()
+        .filter(|e| is_agent_owned_by_wallet(&state, e.id, &wallet))
         .map(|e| {
             serde_json::json!({
                 "id": e.id.to_string(),
@@ -474,14 +878,17 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let uptime = state.started_at.elapsed().as_secs();
     let agent_count = agents.len();
 
-    Json(serde_json::json!({
-        "status": "running",
-        "agent_count": agent_count,
-        "default_provider": state.kernel.config.default_model.provider,
-        "default_model": state.kernel.config.default_model.model,
-        "uptime_seconds": uptime,
-        "agents": agents,
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "running",
+            "agent_count": agent_count,
+            "default_provider": state.kernel.config.default_model.provider,
+            "default_model": state.kernel.config.default_model.model,
+            "uptime_seconds": uptime,
+            "agents": agents,
+        })),
+    )
 }
 
 /// POST /api/shutdown — Graceful shutdown.
@@ -883,6 +1290,7 @@ pub async fn version() -> impl IntoResponse {
 /// GET /api/agents/:id — Get a single agent's detailed info.
 pub async fn get_agent(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
@@ -894,6 +1302,17 @@ pub async fn get_agent(
             );
         }
     };
+
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
 
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -941,6 +1360,7 @@ pub async fn get_agent(
 /// POST /api/agents/:id/message/stream — SSE streaming response.
 pub async fn send_message_stream(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> axum::response::Response {
@@ -968,6 +1388,18 @@ pub async fn send_message_stream(
                 .into_response();
         }
     };
+
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err.into_response(),
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        )
+            .into_response();
+    }
 
     if state.kernel.registry.get(agent_id).is_none() {
         return (
@@ -4406,18 +4838,43 @@ pub async fn update_agent_budget(
 // ---------------------------------------------------------------------------
 
 /// GET /api/sessions — List all sessions with metadata.
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
     match state.kernel.memory.list_sessions() {
-        Ok(sessions) => Json(serde_json::json!({"sessions": sessions})),
-        Err(_) => Json(serde_json::json!({"sessions": []})),
+        Ok(sessions) => {
+            let filtered: Vec<serde_json::Value> = sessions
+                .into_iter()
+                .filter(|session| {
+                    let aid = session
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<AgentId>().ok());
+                    match aid {
+                        Some(agent_id) => is_agent_owned_by_wallet(&state, agent_id, &wallet),
+                        None => false,
+                    }
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({"sessions": filtered})))
+        }
+        Err(_) => (StatusCode::OK, Json(serde_json::json!({"sessions": []}))),
     }
 }
 
 /// DELETE /api/sessions/:id — Delete a session.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+
     let session_id = match id.parse::<uuid::Uuid>() {
         Ok(u) => openfang_types::agent::SessionId(u),
         Err(_) => {
@@ -4427,6 +4884,29 @@ pub async fn delete_session(
             );
         }
     };
+
+    match state.kernel.memory.get_session(session_id) {
+        Ok(Some(session)) => {
+            if !is_agent_owned_by_wallet(&state, session.agent_id, &wallet) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Session not accessible for this user"})),
+                );
+            }
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        }
+    }
 
     match state.kernel.memory.delete_session(session_id) {
         Ok(()) => (
@@ -4443,9 +4923,15 @@ pub async fn delete_session(
 /// PUT /api/sessions/:id/label — Set a session label.
 pub async fn set_session_label(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+
     let session_id = match id.parse::<uuid::Uuid>() {
         Ok(u) => openfang_types::agent::SessionId(u),
         Err(_) => {
@@ -4455,6 +4941,29 @@ pub async fn set_session_label(
             );
         }
     };
+
+    match state.kernel.memory.get_session(session_id) {
+        Ok(Some(session)) => {
+            if !is_agent_owned_by_wallet(&state, session.agent_id, &wallet) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Session not accessible for this user"})),
+                );
+            }
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        }
+    }
 
     let label = req.get("label").and_then(|v| v.as_str());
 
@@ -5570,6 +6079,7 @@ pub async fn mcp_http(
 /// GET /api/agents/{id}/sessions — List all sessions for an agent.
 pub async fn list_agent_sessions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
@@ -5581,6 +6091,16 @@ pub async fn list_agent_sessions(
             )
         }
     };
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
     match state.kernel.list_agent_sessions(agent_id) {
         Ok(sessions) => (
             StatusCode::OK,
@@ -5596,6 +6116,7 @@ pub async fn list_agent_sessions(
 /// POST /api/agents/{id}/sessions — Create a new session for an agent.
 pub async fn create_agent_session(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -5608,6 +6129,16 @@ pub async fn create_agent_session(
             )
         }
     };
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
     let label = req.get("label").and_then(|v| v.as_str());
     match state.kernel.create_agent_session(agent_id, label) {
         Ok(session) => (StatusCode::OK, Json(session)),
@@ -5621,6 +6152,7 @@ pub async fn create_agent_session(
 /// POST /api/agents/{id}/sessions/{session_id}/switch — Switch to an existing session.
 pub async fn switch_agent_session(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((id, session_id_str)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
@@ -5632,6 +6164,16 @@ pub async fn switch_agent_session(
             )
         }
     };
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
     let session_id = match session_id_str.parse::<uuid::Uuid>() {
         Ok(uuid) => openfang_types::agent::SessionId(uuid),
         Err(_) => {
@@ -5658,6 +6200,7 @@ pub async fn switch_agent_session(
 /// POST /api/agents/{id}/session/reset — Reset an agent's session.
 pub async fn reset_session(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let agent_id: AgentId = match id.parse() {
@@ -5669,6 +6212,16 @@ pub async fn reset_session(
             )
         }
     };
+    let wallet = match require_wallet(&state, &headers) {
+        Ok(wallet) => wallet,
+        Err(err) => return err,
+    };
+    if !is_agent_owned_by_wallet(&state, agent_id, &wallet) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Agent not accessible for this user"})),
+        );
+    }
     match state.kernel.reset_session(agent_id) {
         Ok(()) => (
             StatusCode::OK,

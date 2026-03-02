@@ -49,6 +49,7 @@ pub async fn build_router(
         bridge_manager: tokio::sync::Mutex::new(bridge),
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        wallet_challenges: dashmap::DashMap::new(),
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API
@@ -111,6 +112,22 @@ pub async fn build_router(
         .route(
             "/api/metrics",
             axum::routing::get(routes::prometheus_metrics),
+        )
+        .route(
+            "/api/auth/phantom/challenge",
+            axum::routing::post(routes::phantom_challenge),
+        )
+        .route(
+            "/api/auth/phantom/verify",
+            axum::routing::post(routes::phantom_verify),
+        )
+        .route(
+            "/api/auth/phantom/me",
+            axum::routing::get(routes::phantom_me),
+        )
+        .route(
+            "/api/auth/phantom/logout",
+            axum::routing::post(routes::phantom_logout),
         )
         .route("/api/health", axum::routing::get(routes::health))
         .route(

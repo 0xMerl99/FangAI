@@ -1,4 +1,4 @@
-// OpenFang Approvals Page — Execution approval queue for sensitive agent actions
+// FangAI Approvals Page — Execution approval queue for sensitive agent actions
 'use strict';
 
 function approvalsPage() {

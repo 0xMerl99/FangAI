@@ -13,8 +13,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/openfang /usr/local/bin/
 COPY --from=builder /build/agents /opt/openfang/agents
+COPY scripts/render-start.sh /usr/local/bin/render-start.sh
+RUN chmod +x /usr/local/bin/render-start.sh
 EXPOSE 4200
 VOLUME /data
 ENV OPENFANG_HOME=/data
-ENTRYPOINT ["openfang"]
-CMD ["start"]
+ENTRYPOINT ["/usr/local/bin/render-start.sh"]

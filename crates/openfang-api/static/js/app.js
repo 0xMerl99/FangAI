@@ -1,4 +1,4 @@
-// OpenFang App — Alpine.js init, hash router, global store
+// FangAI App — Alpine.js init, hash router, global store
 'use strict';
 
 // Marked.js configuration
@@ -41,6 +41,12 @@ function copyCode(btn) {
       setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
     });
   }
+}
+
+function bytesToBase64(bytes) {
+  var binary = '';
+  for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 // Tool category icon SVGs — returns inline SVG for each tool category
@@ -90,6 +96,8 @@ document.addEventListener('alpine:init', function() {
   // Restore saved API key on load
   var savedKey = localStorage.getItem('openfang-api-key');
   if (savedKey) OpenFangAPI.setAuthToken(savedKey);
+  var savedUserSession = localStorage.getItem('openfang-user-session');
+  if (savedUserSession) OpenFangAPI.setUserSession(savedUserSession);
 
   Alpine.store('app', {
     agents: [],
@@ -104,6 +112,9 @@ document.addEventListener('alpine:init', function() {
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
     showAuthPrompt: false,
+    showWalletPrompt: true,
+    walletAddress: '',
+    connectingWallet: false,
 
     toggleFocusMode() {
       this.focusMode = !this.focusMode;
@@ -129,7 +140,7 @@ document.addEventListener('alpine:init', function() {
       } catch(e) {
         this.connected = false;
         this.lastError = e.message || 'Unknown error';
-        console.warn('[OpenFang] Status check failed:', e.message);
+        console.warn('[FangAI] Status check failed:', e.message);
       }
     },
 
@@ -184,6 +195,74 @@ document.addEventListener('alpine:init', function() {
     clearApiKey() {
       OpenFangAPI.setAuthToken('');
       localStorage.removeItem('openfang-api-key');
+    },
+
+    async checkWalletSession() {
+      try {
+        var me = await OpenFangAPI.get('/api/auth/phantom/me');
+        this.walletAddress = me.wallet_address || '';
+        this.showWalletPrompt = !this.walletAddress;
+        return !!this.walletAddress;
+      } catch(e) {
+        this.walletAddress = '';
+        this.showWalletPrompt = true;
+        OpenFangAPI.setUserSession('');
+        localStorage.removeItem('openfang-user-session');
+        return false;
+      }
+    },
+
+    async connectPhantom() {
+      if (this.connectingWallet) return;
+      this.connectingWallet = true;
+      try {
+        if (!window.solana || !window.solana.isPhantom) {
+          throw new Error('Phantom wallet not detected. Install Phantom extension first.');
+        }
+        var connection = await window.solana.connect();
+        var wallet = connection.publicKey.toString();
+        var challengeResp = await OpenFangAPI.post('/api/auth/phantom/challenge', {
+          wallet_address: wallet
+        });
+
+        var challengeText = challengeResp.challenge || '';
+        var messageBytes = new TextEncoder().encode(challengeText);
+        var signed = await window.solana.signMessage(messageBytes, 'utf8');
+        var signatureB64 = bytesToBase64(signed.signature);
+
+        var verifyResp = await OpenFangAPI.post('/api/auth/phantom/verify', {
+          wallet_address: wallet,
+          signature_base64: signatureB64
+        });
+
+        OpenFangAPI.setUserSession(verifyResp.token);
+        localStorage.setItem('openfang-user-session', verifyResp.token);
+        this.walletAddress = verifyResp.user && verifyResp.user.wallet_address
+          ? verifyResp.user.wallet_address
+          : wallet;
+        this.showWalletPrompt = false;
+        this.booting = false;
+        this.lastError = '';
+        await this.checkStatus();
+        await this.refreshAgents();
+        OpenFangToast.success('Wallet connected');
+      } catch (e) {
+        this.lastError = e.message || 'Wallet login failed';
+        this.showWalletPrompt = true;
+        OpenFangToast.error(this.lastError);
+      } finally {
+        this.connectingWallet = false;
+      }
+    },
+
+    async logoutWallet() {
+      try { await OpenFangAPI.post('/api/auth/phantom/logout', {}); } catch(e) { /* ignore */ }
+      OpenFangAPI.setUserSession('');
+      localStorage.removeItem('openfang-user-session');
+      this.walletAddress = '';
+      this.agents = [];
+      this.agentCount = 0;
+      this.showWalletPrompt = true;
     }
   });
 });
@@ -273,10 +352,18 @@ function app() {
       });
 
       // Initial data load
-      this.pollStatus();
-      Alpine.store('app').checkOnboarding();
-      Alpine.store('app').checkAuth();
-      setInterval(function() { self.pollStatus(); }, 5000);
+      Alpine.store('app').checkWalletSession().then(function(ok) {
+        if (!ok) {
+          Alpine.store('app').booting = false;
+          return;
+        }
+        self.pollStatus();
+        Alpine.store('app').checkOnboarding();
+        Alpine.store('app').checkAuth();
+        setInterval(function() {
+          if (!Alpine.store('app').showWalletPrompt) self.pollStatus();
+        }, 5000);
+      });
     },
 
     navigate(p) {

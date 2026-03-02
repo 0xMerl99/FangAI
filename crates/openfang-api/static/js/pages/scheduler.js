@@ -1,4 +1,4 @@
-// OpenFang Scheduler Page — Cron job management + event triggers unified view
+// FangAI Scheduler Page — Cron job management + event triggers unified view
 'use strict';
 
 function schedulerPage() {

@@ -82,6 +82,10 @@ pub async fn auth(
     // Public endpoints that don't require auth (dashboard needs these)
     let path = request.uri().path();
     if path == "/"
+        || path == "/api/auth/phantom/challenge"
+        || path == "/api/auth/phantom/verify"
+        || path == "/api/auth/phantom/me"
+        || path == "/api/auth/phantom/logout"
         || path == "/api/health"
         || path == "/api/health/detail"
         || path == "/api/status"

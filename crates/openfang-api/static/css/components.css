@@ -1,4 +1,4 @@
-/* OpenFang Components — Premium design system */
+/* FangAI Components — Premium design system */
 
 /* Buttons */
 .btn {
@@ -225,6 +225,86 @@ tr:hover td { background: var(--surface2); }
   overflow-y: auto;
   box-shadow: var(--shadow-xl);
   animation: scaleIn 0.2s var(--ease-spring);
+}
+
+.wallet-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(8, 7, 6, 0.65);
+  backdrop-filter: blur(4px);
+}
+
+.wallet-modal-card {
+  width: min(420px, 100%);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+  box-shadow: var(--shadow-lg);
+}
+
+.wallet-modal-title {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  color: var(--text);
+}
+
+.wallet-modal-desc {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  margin: 0 0 1rem;
+}
+
+.wallet-modal-connect-btn {
+  width: 100%;
+  padding: 0.65rem;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.wallet-modal-connect-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.wallet-modal-error {
+  margin-top: 0.75rem;
+  color: var(--error);
+  font-size: 0.8rem;
+}
+
+.sidebar-wallet {
+  padding: 0 12px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sidebar-wallet-address {
+  min-width: 0;
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-wallet-logout {
+  padding: 2px 8px;
+  flex-shrink: 0;
 }
 
 .modal-header {
@@ -902,6 +982,29 @@ mark.search-highlight {
 .sidebar-footer {
   padding: 8px 0;
   border-top: 1px solid var(--border);
+}
+
+.sidebar-social {
+  padding: 0 16px 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-social-link {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 11px;
+  transition: color var(--transition-fast);
+}
+
+.sidebar-social-link:hover {
+  color: var(--text);
+}
+
+.sidebar-social-sep {
+  color: var(--text-muted);
+  font-size: 10px;
 }
 
 /* Copy button copied state */
