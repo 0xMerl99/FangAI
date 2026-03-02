@@ -11,6 +11,6 @@ services:
       - key: DEFAULT_MODEL_NAME
         value: claude-3-5-sonnet-20241022
       - key: DEFAULT_MODEL_API_KEY_ENV
-        value: ANTHROPIC_API_KEY
-      - key: ANTHROPIC_API_KEY
-        sync: false
+        value: ""
+      - key: OPENFANG_ALLOW_REMOTE_WITHOUT_API_KEY
+        value: "true"

@@ -54,6 +54,17 @@ pub async fn auth(
 ) -> Response<Body> {
     // If no API key configured, restrict to loopback addresses only.
     if api_key.is_empty() {
+        let allow_remote_without_api_key = std::env::var("OPENFANG_ALLOW_REMOTE_WITHOUT_API_KEY")
+            .map(|v| {
+                let normalized = v.trim().to_ascii_lowercase();
+                normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+            })
+            .unwrap_or(false);
+
+        if allow_remote_without_api_key {
+            return next.run(request).await;
+        }
+
         let is_loopback = request
             .extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
